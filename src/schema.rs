@@ -20,7 +20,18 @@ static ENTITY_REGISTRY: OnceLock<RwLock<HashMap<String, ProtoMessage>>> = OnceLo
 /// This function is idempotent - if the registry is already initialized, it updates it.
 pub fn initialize_entity_registry(proto_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let messages = proto_parser::parse_proto_file(proto_path)?;
+    initialize_registry_from_messages(messages)
+}
 
+/// Initialize the entity registry from proto content string.
+/// This should be called once at application startup.
+/// This function is idempotent - if the registry is already initialized, it updates it.
+pub fn initialize_entity_registry_from_content(content: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let messages = proto_parser::parse_proto_content(content)?;
+    initialize_registry_from_messages(messages)
+}
+
+fn initialize_registry_from_messages(messages: Vec<proto_parser::ProtoMessage>) -> Result<(), Box<dyn std::error::Error>> {
     let mut registry = HashMap::new();
     for message in messages {
         // Convert message name to entity type (lowercase)

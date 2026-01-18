@@ -19,6 +19,12 @@ pub struct ProtoMessage {
 /// Excludes system messages like IngestRecord, IngestResponse, etc.
 pub fn parse_proto_file(proto_path: &std::path::Path) -> Result<Vec<ProtoMessage>, Box<dyn std::error::Error>> {
     let content = std::fs::read_to_string(proto_path)?;
+    parse_proto_content(&content)
+}
+
+/// Parse proto content from a string and extract entity message definitions.
+/// Excludes system messages like IngestRecord, IngestResponse, etc.
+pub fn parse_proto_content(content: &str) -> Result<Vec<ProtoMessage>, Box<dyn std::error::Error>> {
     let lines: Vec<&str> = content.lines().collect();
 
     let mut messages = Vec::new();
