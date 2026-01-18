@@ -1,0 +1,15 @@
+syntax = "proto3";
+
+package reflog.v1;
+
+import "google/protobuf/descriptor.proto";
+
+// Custom field options for declaring relationships
+extend google.protobuf.FieldOptions {
+  // Declares this field is a foreign key reference
+  // Format: "EntityType.field_name" (e.g., "User.id")
+  string foreign_key = 50001;
+
+  // Relationship type: "many_to_one", "one_to_many", "many_to_many", "one_to_one"
+  string relationship_type = 50002;
+}

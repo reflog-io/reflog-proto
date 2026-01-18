@@ -1,0 +1,24 @@
+syntax = "proto3";
+
+package reflog.v1;
+
+import "options.proto";
+
+message User {
+  string id = 1;
+  string name = 2;
+  string email = 3;
+}
+
+message Article {
+  string id = 1;
+  string author_id = 2 [(reflog.v1.foreign_key) = "User.id", (reflog.v1.relationship_type) = "many_to_one"];
+  string title = 3;
+  string body = 4;
+}
+
+message Comment {
+  string article_id = 5 [(reflog.v1.foreign_key) = "Article.id", (reflog.v1.relationship_type) = "many_to_one"];
+  string user_id = 6 [(reflog.v1.foreign_key) = "User.id", (reflog.v1.relationship_type) = "many_to_one"];
+  string comment = 7;
+}

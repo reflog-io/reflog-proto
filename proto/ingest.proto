@@ -1,0 +1,52 @@
+syntax = "proto3";
+
+package reflog.v1;
+
+import "options.proto";
+
+message IngestRecord {
+  string entity_type = 1;
+  string entity_id = 2;
+  Operation operation = 3;
+  bytes payload = 4;
+  int64 received_at_utc = 5; // UTC timestamp in milliseconds since Unix epoch
+}
+
+enum Operation {
+  OPERATION_UNSPECIFIED = 0;
+  OPERATION_CREATE = 1;
+  OPERATION_UPDATE = 2;
+  OPERATION_DELETE = 3;
+}
+
+message IngestResponse {
+  bool ok = 1;
+  string message = 2;
+}
+
+service IngestService {
+  rpc Ingest(IngestRecord) returns (IngestResponse);
+}
+
+message HealthCheckRequest {}
+
+message HealthCheckResponse {
+  bool ok = 1;
+  string message = 2;
+}
+
+service HealthService {
+  rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
+}
+
+message GetProtosRequest {
+  optional string version = 1;
+}
+
+message GetProtosResponse {
+  string proto_content = 1;
+}
+
+service ProtoService {
+  rpc GetProtos(GetProtosRequest) returns (GetProtosResponse);
+}
