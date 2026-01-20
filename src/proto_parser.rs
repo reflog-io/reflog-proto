@@ -1,4 +1,16 @@
 //! Parser for .proto files to extract message and field definitions.
+//! Uses `nom` to handle grammar, nesting, and whitespace robustly.
+
+use nom::{
+    branch::alt,
+    bytes::complete::{is_not, tag, take_until},
+    character::complete::{alpha1, alphanumeric1, char, digit1, multispace1, none_of},
+    combinator::{map, opt, recognize, value},
+    multi::{many0, separated_list0},
+    sequence::{delimited, pair, preceded, tuple},
+    IResult,
+};
+use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
 pub struct ProtoField {
@@ -13,184 +25,214 @@ pub struct ProtoField {
 pub struct ProtoMessage {
     pub name: String,
     pub fields: Vec<ProtoField>,
+    pub nested_messages: Vec<ProtoMessage>,
 }
 
 /// Parse a proto file and extract entity message definitions.
-/// Excludes system messages like IngestRecord, IngestResponse, etc.
-pub fn parse_proto_file(proto_path: &std::path::Path) -> Result<Vec<ProtoMessage>, Box<dyn std::error::Error>> {
+pub fn parse_proto_file(
+    proto_path: &std::path::Path,
+) -> Result<Vec<ProtoMessage>, Box<dyn std::error::Error>> {
     let content = std::fs::read_to_string(proto_path)?;
     parse_proto_content(&content)
 }
 
-/// Parse proto content from a string and extract entity message definitions.
-/// Excludes system messages like IngestRecord, IngestResponse, etc.
-pub fn parse_proto_content(content: &str) -> Result<Vec<ProtoMessage>, Box<dyn std::error::Error>> {
-    let lines: Vec<&str> = content.lines().collect();
+/// Parse proto content and extract entity message definitions.
+pub fn parse_proto_content(
+    content: &str,
+) -> Result<Vec<ProtoMessage>, Box<dyn std::error::Error>> {
+    // 1. Run the nom parser on the whole content
+    let (_, mut items) = parse_proto_root(content)
+        .map_err(|e| format!("Failed to parse proto file: {}", e))?;
 
-    let mut messages = Vec::new();
-    let mut current_message: Option<String> = None;
-    let mut current_fields: Vec<ProtoField> = Vec::new();
-    let mut in_message = false;
+    // 2. Filter out system messages
+    // (We do this post-parse to keep the grammar clean)
+    let excluded_messages = [
+        "IngestRecord", "IngestResponse", "Operation",
+        "HealthCheckRequest", "HealthCheckResponse",
+        "GetProtosRequest", "GetProtosResponse",
+    ];
 
-    // Messages to exclude (system messages)
-    let excluded_messages = ["IngestRecord", "IngestResponse", "Operation",
-                            "HealthCheckRequest", "HealthCheckResponse",
-                            "GetProtosRequest", "GetProtosResponse"];
+    items.retain(|msg| !excluded_messages.contains(&msg.name.as_str()));
 
-    for (i, line) in lines.iter().enumerate() {
-        let trimmed = line.trim();
-
-        // Detect message start
-        if trimmed.starts_with("message ") {
-            // Save previous message if any
-            if let Some(msg_name) = current_message.take() {
-                if !excluded_messages.contains(&msg_name.as_str()) {
-                    messages.push(ProtoMessage {
-                        name: msg_name,
-                        fields: current_fields.clone(),
-                    });
-                }
-                current_fields.clear();
-            }
-
-            let message_name = trimmed
-                .strip_prefix("message ")
-                .and_then(|s| s.split_whitespace().next())
-                .unwrap_or("")
-                .to_string();
-
-            if !excluded_messages.contains(&message_name.as_str()) {
-                current_message = Some(message_name);
-                in_message = true;
-            }
-            continue;
-        }
-
-        // Detect message end
-        if trimmed == "}" && in_message {
-            if let Some(msg_name) = current_message.take() {
-                if !excluded_messages.contains(&msg_name.as_str()) {
-                    messages.push(ProtoMessage {
-                        name: msg_name,
-                        fields: current_fields.clone(),
-                    });
-                }
-                current_fields.clear();
-            }
-            in_message = false;
-            continue;
-        }
-
-        // Parse fields within a message
-        if in_message && current_message.is_some() {
-            if let Some(field) = parse_field_line(line, i, &lines) {
-                current_fields.push(field);
-            }
-        }
-    }
-
-    // Handle last message if file doesn't end with }
-    if let Some(msg_name) = current_message {
-        if !excluded_messages.contains(&msg_name.as_str()) {
-            messages.push(ProtoMessage {
-                name: msg_name,
-                fields: current_fields,
-            });
-        }
-    }
-
-    Ok(messages)
+    Ok(items)
 }
 
-fn parse_field_line(line: &str, line_idx: usize, all_lines: &[&str]) -> Option<ProtoField> {
-    let trimmed = line.trim();
+// ==========================================
+//           Nom Parser Logic
+// ==========================================
 
-    // Skip empty lines, comments, and closing braces
-    if trimmed.is_empty() || trimmed.starts_with("//") || trimmed == "}" {
-        return None;
-    }
+/// Parses whitespace and comments (// ... or /* ... */)
+fn ws(input: &str) -> IResult<&str, &str> {
+    recognize(many0(alt((
+        multispace1,
+        preceded(tag("//"), take_until("\n")),
+        recognize(delimited(tag("/*"), take_until("*/"), tag("*/"))),
+    ))))(input)
+}
 
-    // Check if this line has field options (foreign_key annotations)
-    let has_options = trimmed.contains("[(reflog.v1.foreign_key)");
+/// Helper to wrap a parser with whitespace handling
+fn ws_delimited<'a, O, F>(inner: F) -> impl FnMut(&'a str) -> IResult<&'a str, O>
+where
+    F: FnMut(&'a str) -> IResult<&'a str, O>,
+{
+    delimited(ws, inner, ws)
+}
 
-    // Find the field definition - it might be on this line or previous lines
-    let mut field_type = String::new();
-    let mut field_name = String::new();
-    let mut field_number = 0u32;
-    let mut full_line = trimmed.to_string();
+/// Identifiers (e.g., MessageName, field_name, package.name)
+fn identifier(input: &str) -> IResult<&str, &str> {
+    recognize(pair(
+        alt((alpha1, tag("_"))),
+        many0(alt((alphanumeric1, tag("_"), tag(".")))),
+    ))(input)
+}
 
-    // If options are on a separate line, combine with previous line
-    if has_options && !trimmed.contains('=') {
-        // Look for the field definition on previous lines
-        for j in (line_idx.saturating_sub(3)..line_idx).rev() {
-            if let Some(prev_line) = all_lines.get(j) {
-                let prev_trimmed = prev_line.trim();
-                if prev_trimmed.contains('=') && !prev_trimmed.starts_with("//") {
-                    full_line = format!("{} {}", prev_trimmed, trimmed);
-                    break;
-                }
-            }
-        }
-    }
+/// Parse a quoted string literal: "value"
+fn string_literal(input: &str) -> IResult<&str, String> {
+    delimited(
+        char('"'),
+        map(many0(none_of("\"")), |chars: Vec<char>| chars.into_iter().collect()),
+        char('"'),
+    )(input)
+}
 
-    // Parse field definition: "type field_name = number" or "type field_name = number [(options)]"
-    // Remove everything after '[' if present, then parse
-    let field_def_part = if let Some(bracket_pos) = full_line.find('[') {
-        &full_line[..bracket_pos]
-    } else {
-        &full_line
-    };
+/// Parse field options: [(reflog.v1.foreign_key) = "Val", (other) = "x"]
+fn parse_field_options(input: &str) -> IResult<&str, HashMap<String, String>> {
+    let option_pair = map(
+        tuple((
+            opt(char('(')),
+            identifier,
+            opt(char(')')),
+            ws_delimited(char('=')),
+            string_literal
+        )),
+        |(_, key, _, _, val)| (key.to_string(), val)
+    );
 
-    // Remove semicolon
-    let field_def_part = field_def_part.trim_end_matches(';').trim();
+    let options_list = delimited(
+        char('['),
+        separated_list0(ws_delimited(char(',')), option_pair),
+        char(']')
+    );
 
-    // Split by whitespace
-    let parts: Vec<&str> = field_def_part.split_whitespace().collect();
-    if parts.len() >= 3 {
-        field_type = parts[0].to_string();
-        field_name = parts[1].to_string();
+    map(options_list, |opts| opts.into_iter().collect())(input)
+}
 
-        // Extract field number from "= number"
-        if parts.len() >= 3 && parts[2] == "=" && parts.len() >= 4 {
-            field_number = parts[3].parse().unwrap_or(0);
-        } else if parts[2].starts_with('=') {
-            // Handle "=number" without space
-            let num_str = parts[2].trim_start_matches('=');
-            field_number = num_str.parse().unwrap_or(0);
-        }
-    }
+/// Parse a single field definition
+/// matches: `optional string name = 1 [(options)];`
+fn parse_proto_field(input: &str) -> IResult<&str, ProtoField> {
+    let (input, _) = opt(ws_delimited(alt((tag("repeated"), tag("optional"), tag("required")))))(input)?;
 
-    if field_name.is_empty() || field_number == 0 {
-        return None;
-    }
+    // Parse Type (handles map<string, int> and standard types)
+    let (input, proto_type) = ws_delimited(recognize(pair(
+        identifier,
+        opt(delimited(char('<'), is_not(">"), char('>')))
+    )))(input)?;
 
-    // Extract foreign_key and relationship_type from annotations
+    let (input, name) = ws_delimited(identifier)(input)?;
+    let (input, _) = ws_delimited(char('='))(input)?;
+    let (input, field_number) = ws_delimited(digit1)(input)?;
+
+    // Parse Options (optional)
+    let (input, options) = opt(ws_delimited(parse_field_options))(input)?;
+    let (input, _) = ws_delimited(char(';'))(input)?;
+
+    // Extract special keys
     let mut foreign_key = None;
     let mut relationship_type = None;
 
-    if has_options {
-        // Extract foreign_key option value
-        if let Some(start) = full_line.find("foreign_key) = \"") {
-            let start_idx = start + "foreign_key) = \"".len();
-            if let Some(end) = full_line[start_idx..].find('"') {
-                foreign_key = Some(full_line[start_idx..start_idx + end].to_string());
-            }
-        }
-
-        // Extract relationship_type option value
-        if let Some(start) = full_line.find("relationship_type) = \"") {
-            let start_idx = start + "relationship_type) = \"".len();
-            if let Some(end) = full_line[start_idx..].find('"') {
-                relationship_type = Some(full_line[start_idx..start_idx + end].to_string());
+    if let Some(opts) = options {
+        // We look for keys ending in foreign_key or relationship_type
+        // to handle fully qualified keys like `reflog.v1.foreign_key`
+        for (k, v) in opts {
+            if k.contains("foreign_key") {
+                foreign_key = Some(v);
+            } else if k.contains("relationship_type") {
+                relationship_type = Some(v);
             }
         }
     }
 
-    Some(ProtoField {
-        name: field_name,
-        proto_type: field_type,
-        field_number,
+    Ok((input, ProtoField {
+        name: name.to_string(),
+        proto_type: proto_type.to_string(),
+        field_number: field_number.parse().unwrap_or(0),
         foreign_key,
         relationship_type,
-    })
+    }))
+}
+
+/// Parse a Message block (recursive)
+fn parse_message(input: &str) -> IResult<&str, ProtoMessage> {
+    let (input, _) = ws_delimited(tag("message"))(input)?;
+    let (input, name) = ws_delimited(identifier)(input)?;
+    let (input, _) = ws_delimited(char('{'))(input)?;
+
+    // Inner loop to handle contents of message
+    // We only care about Fields and Nested Messages, but we must parse (and ignore)
+    // things like `option`, `reserved`, etc., so the parser doesn't get stuck.
+    #[derive(Clone)]
+    enum Item {
+        Field(ProtoField),
+        Nested(ProtoMessage),
+        Ignored,
+    }
+
+    let (input, items) = many0(alt((
+        map(parse_message, Item::Nested),
+        map(parse_proto_field, Item::Field),
+        // Ignorables:
+        // 1. Reserved statements: reserved 1, 2;
+        value(Item::Ignored, tuple((ws_delimited(tag("reserved")), take_until(";"), char(';')))),
+        // 2. Option statements: option (x) = y;
+        value(Item::Ignored, tuple((ws_delimited(tag("option")), take_until(";"), char(';')))),
+        // 3. Map fields (if using `map` keyword specifically, though `parse_proto_field` handles map types)
+        // 4. OneOfs (simple skip for now, can be expanded)
+        value(Item::Ignored, tuple((ws_delimited(tag("oneof")), identifier, ws_delimited(char('{')), take_until("}")))),
+    )))(input)?;
+
+    let (input, _) = ws_delimited(char('}'))(input)?;
+
+    let mut fields = Vec::new();
+    let mut nested_messages = Vec::new();
+
+    for item in items {
+        match item {
+            Item::Field(f) => fields.push(f),
+            Item::Nested(m) => nested_messages.push(m),
+            Item::Ignored => {}
+        }
+    }
+
+    Ok((input, ProtoMessage {
+        name: name.to_string(),
+        fields,
+        nested_messages,
+    }))
+}
+
+/// Top level parser: handles syntax decl, package, imports, service, and messages
+fn parse_proto_root(input: &str) -> IResult<&str, Vec<ProtoMessage>> {
+    let (input, _) = ws(input)?; // Consume leading whitespace
+
+    let (input, found_items) = many0(alt((
+        map(parse_message, Some),
+        // Skip Syntax
+        value(None, tuple((ws_delimited(tag("syntax")), take_until(";"), char(';')))),
+        // Skip Package
+        value(None, tuple((ws_delimited(tag("package")), take_until(";"), char(';')))),
+        // Skip Imports
+        value(None, tuple((ws_delimited(tag("import")), take_until(";"), char(';')))),
+        // Skip Options
+        value(None, tuple((ws_delimited(tag("option")), take_until(";"), char(';')))),
+        // Skip Service (and its body)
+        value(None, tuple((
+            ws_delimited(tag("service")),
+            identifier,
+            ws_delimited(char('{')),
+            take_until("}"), // Lazy skip of service body
+            char('}')
+        ))),
+    )))(input)?;
+
+    Ok((input, found_items.into_iter().flatten().collect()))
 }
