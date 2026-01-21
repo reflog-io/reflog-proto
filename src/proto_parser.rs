@@ -96,6 +96,7 @@ fn string_literal(input: &str) -> IResult<&str, String> {
 }
 
 /// Parse field options: [(reflog.v1.foreign_key) = "Val", (other) = "x"]
+/// Supports multi-line options with proper whitespace handling
 fn parse_field_options(input: &str) -> IResult<&str, HashMap<String, String>> {
     let option_pair = map(
         tuple((
@@ -108,10 +109,11 @@ fn parse_field_options(input: &str) -> IResult<&str, HashMap<String, String>> {
         |(_, key, _, _, val)| (key.to_string(), val)
     );
 
+    // Handle whitespace/newlines inside brackets by using ws_delimited for the delimited parser
     let options_list = delimited(
-        char('['),
+        ws_delimited(char('[')),
         separated_list0(ws_delimited(char(',')), option_pair),
-        char(']')
+        ws_delimited(char(']'))
     );
 
     map(options_list, |opts| opts.into_iter().collect())(input)
