@@ -40,7 +40,10 @@ pub fn initialize_entity_registry(proto_path: &Path) -> Result<(), Box<dyn std::
 /// This should be called once at application startup.
 /// This function is idempotent - if the registry is already initialized, it updates it.
 pub fn initialize_entity_registry_from_content(content: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let messages = proto_parser::parse_proto_content(content)?;
+    // When using CUSTOM_PROTO_CONTENT, we want to add timestamp fields
+    // For other content, this would typically be false
+    let add_timestamps = content == crate::CUSTOM_PROTO_CONTENT;
+    let messages = proto_parser::parse_proto_content(content, add_timestamps)?;
     initialize_registry_from_messages(messages)
 }
 

@@ -33,12 +33,21 @@ pub fn parse_proto_file(
     proto_path: &std::path::Path,
 ) -> Result<Vec<ProtoMessage>, Box<dyn std::error::Error>> {
     let content = std::fs::read_to_string(proto_path)?;
-    parse_proto_content(&content)
+    // Only add timestamp fields for custom.proto
+    let is_custom_proto = proto_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| n == "custom.proto")
+        .unwrap_or(false);
+    parse_proto_content(&content, is_custom_proto)
 }
 
 /// Parse proto content and extract entity message definitions.
+/// If `add_timestamps` is true, automatically adds created_at, updated_at, and deleted_at
+/// fields to all top-level messages.
 pub fn parse_proto_content(
     content: &str,
+    add_timestamps: bool,
 ) -> Result<Vec<ProtoMessage>, Box<dyn std::error::Error>> {
     // 1. Run the nom parser on the whole content
     let (_, mut items) = parse_proto_root(content)
@@ -54,7 +63,65 @@ pub fn parse_proto_content(
 
     items.retain(|msg| !excluded_messages.contains(&msg.name.as_str()));
 
+    // 3. Add timestamp fields (created_at, updated_at, deleted_at) to all top-level messages
+    // if requested (e.g., for custom.proto)
+    if add_timestamps {
+        for message in &mut items {
+            add_timestamp_fields(message);
+        }
+    }
+
     Ok(items)
+}
+
+/// Add created_at, updated_at, and deleted_at fields to a message if they don't already exist.
+fn add_timestamp_fields(message: &mut ProtoMessage) {
+    // Check if timestamp fields already exist
+    let has_created_at = message.fields.iter().any(|f| f.name == "created_at");
+    let has_updated_at = message.fields.iter().any(|f| f.name == "updated_at");
+    let has_deleted_at = message.fields.iter().any(|f| f.name == "deleted_at");
+
+    // Find the maximum field number
+    let max_field_number = message.fields
+        .iter()
+        .map(|f| f.field_number)
+        .max()
+        .unwrap_or(0);
+
+    // Add missing timestamp fields
+    let mut next_field_number = max_field_number + 1;
+
+    if !has_created_at {
+        message.fields.push(ProtoField {
+            name: "created_at".to_string(),
+            proto_type: "int64".to_string(),
+            field_number: next_field_number,
+            foreign_key: None,
+            relationship_type: None,
+        });
+        next_field_number += 1;
+    }
+
+    if !has_updated_at {
+        message.fields.push(ProtoField {
+            name: "updated_at".to_string(),
+            proto_type: "int64".to_string(),
+            field_number: next_field_number,
+            foreign_key: None,
+            relationship_type: None,
+        });
+        next_field_number += 1;
+    }
+
+    if !has_deleted_at {
+        message.fields.push(ProtoField {
+            name: "deleted_at".to_string(),
+            proto_type: "int64".to_string(),
+            field_number: next_field_number,
+            foreign_key: None,
+            relationship_type: None,
+        });
+    }
 }
 
 // ==========================================
