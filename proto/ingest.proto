@@ -10,6 +10,9 @@ message IngestRecord {
   Operation operation = 3;
   bytes payload = 4;
   int64 received_at_utc = 5; // UTC timestamp in milliseconds since Unix epoch
+  optional int64 created_at_utc = 6; // Optional: UTC timestamp in milliseconds since Unix epoch
+  optional int64 updated_at_utc = 7; // Optional: UTC timestamp in milliseconds since Unix epoch
+  optional int64 deleted_at_utc = 8; // Optional: UTC timestamp in milliseconds since Unix epoch
 }
 
 enum Operation {
