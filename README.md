@@ -45,7 +45,6 @@ The `proto/` directory contains the shared proto definitions:
 
 - `ingest.proto` - Core ingest service messages
 - `options.proto` - Custom field options (foreign keys, relationships)
-- `custom.proto` - Example entity definitions (User, Article, Comment)
 
 ## License
 

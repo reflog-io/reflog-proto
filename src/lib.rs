@@ -25,10 +25,6 @@ pub mod pb {
 pub mod proto_parser;
 pub mod schema;
 
-/// The embedded custom.proto file content.
-/// Use this with `initialize_entity_registry_from_content` to avoid needing proto files at runtime.
-pub const CUSTOM_PROTO_CONTENT: &str = include_str!("../proto/custom.proto");
-
 // Re-export commonly used types
 pub use proto_parser::{ProtoField, ProtoMessage};
 pub use schema::{
