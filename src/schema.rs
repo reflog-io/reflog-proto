@@ -12,8 +12,8 @@ use crate::proto_parser::{self, ProtoField, ProtoMessage};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use nom::{
     bytes::complete::take,
-    number::complete::{le_f32, le_f64, le_u32, le_u64},
     error::{Error as NomError, ErrorKind},
+    number::complete::{le_f32, le_f64, le_u32, le_u64},
     IResult,
 };
 use serde_json::Value;
@@ -39,14 +39,18 @@ pub fn initialize_entity_registry(proto_path: &Path) -> Result<(), Box<dyn std::
 /// Initialize the entity registry from proto content string.
 /// This should be called once at application startup.
 /// This function is idempotent - if the registry is already initialized, it updates it.
-pub fn initialize_entity_registry_from_content(content: &str) -> Result<(), Box<dyn std::error::Error>> {
+pub fn initialize_entity_registry_from_content(
+    content: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
     // Timestamp fields (created_at_utc, updated_at_utc, deleted_at_utc) are now
     // provided at the top level in IngestRecord, so we no longer add them to payload messages
     let messages = proto_parser::parse_proto_content(content)?;
     initialize_registry_from_messages(messages)
 }
 
-fn initialize_registry_from_messages(messages: Vec<ProtoMessage>) -> Result<(), Box<dyn std::error::Error>> {
+fn initialize_registry_from_messages(
+    messages: Vec<ProtoMessage>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut registry = HashMap::new();
 
     // Helper to register messages recursively (supporting nested definitions)
@@ -133,7 +137,10 @@ pub fn payload_to_json_partial(
                 // Warning: trailing bytes usually indicate malformed proto or wrong schema,
                 // but we return the value we found for best effort.
                 // Alternatively, return an Err if strictness is required.
-                return Err(format!("Payload has {} unexpected trailing bytes", remaining.len()));
+                return Err(format!(
+                    "Payload has {} unexpected trailing bytes",
+                    remaining.len()
+                ));
             }
             Ok(value)
         }
@@ -144,7 +151,8 @@ pub fn payload_to_json_partial(
 /// Encode JSON to protobuf wire format for a given entity type.
 pub fn json_to_payload(entity_type: &str, json: &Value) -> Result<Vec<u8>, String> {
     let message_def = get_message_definition(entity_type)?;
-    let obj = json.as_object()
+    let obj = json
+        .as_object()
         .ok_or_else(|| "JSON must be an object".to_string())?;
 
     encode_message_to_wire(&message_def, obj)
@@ -175,20 +183,18 @@ fn parse_message_nom<'a>(
         let (rest, (field_number, wire_type)) = parse_tag(input)?;
 
         if let Some(field) = field_map.get(&field_number) {
-            let (rest_after_val, value) = parse_field_value_nom(
-                rest,
-                wire_type,
-                &field.proto_type,
-                message_def,
-                partial
-            )?;
+            let (rest_after_val, value) =
+                parse_field_value_nom(rest, wire_type, &field.proto_type, message_def, partial)?;
             input = rest_after_val;
 
             // Handle repeated fields logic
             // Note: Since 'is_repeated' might not be available in all parser versions,
             // we use the accumulator strategy: if a key appears twice, it's repeated.
             if repeated_accumulator.contains_key(&field.name) {
-                repeated_accumulator.get_mut(&field.name).unwrap().push(value);
+                repeated_accumulator
+                    .get_mut(&field.name)
+                    .unwrap()
+                    .push(value);
             } else if let Some(existing) = obj.remove(&field.name) {
                 // Second occurrence found, move to accumulator
                 repeated_accumulator.insert(field.name.clone(), vec![existing, value]);
@@ -232,33 +238,42 @@ fn parse_field_value_nom<'a>(
     partial: bool,
 ) -> IResult<&'a [u8], Value> {
     match wire_type {
-        0 => { // Varint
+        0 => {
+            // Varint
             let (input, val) = parse_varint(input)?;
             let json_val = match proto_type {
                 "bool" => Value::Bool(val != 0),
                 "sint32" | "sint64" => {
                     // ZigZag decode
-                    let decoded = (val >> 1) ^ (-( (val & 1) as i64 ) as u64);
+                    let decoded = (val >> 1) ^ (-((val & 1) as i64) as u64);
                     Value::Number(serde_json::Number::from(decoded as i64))
-                },
+                }
                 // Default to unsigned/signed int
                 _ => Value::Number(serde_json::Number::from(val)),
             };
             Ok((input, json_val))
         }
-        1 => { // 64-bit
+        1 => {
+            // 64-bit
             match proto_type {
                 "double" => {
                     let (input, val) = le_f64(input)?;
-                    Ok((input, serde_json::Number::from_f64(val).map(Value::Number).unwrap_or(Value::Null)))
-                },
-                _ => { // fixed64, sfixed64
+                    Ok((
+                        input,
+                        serde_json::Number::from_f64(val)
+                            .map(Value::Number)
+                            .unwrap_or(Value::Null),
+                    ))
+                }
+                _ => {
+                    // fixed64, sfixed64
                     let (input, val) = le_u64(input)?;
                     Ok((input, Value::Number(val.into())))
                 }
             }
         }
-        2 => { // Length Delimited
+        2 => {
+            // Length Delimited
             let (input, len) = parse_varint(input)?;
             let (input, data) = take(len as usize)(input)?;
 
@@ -266,10 +281,8 @@ fn parse_field_value_nom<'a>(
                 "string" => {
                     let s = String::from_utf8_lossy(data).into_owned();
                     Ok((input, Value::String(s)))
-                },
-                "bytes" => {
-                    Ok((input, Value::String(BASE64.encode(data))))
-                },
+                }
+                "bytes" => Ok((input, Value::String(BASE64.encode(data)))),
                 _ => {
                     // It's a nested message
                     // We attempt to find the definition globally since we don't have easy access
@@ -284,13 +297,20 @@ fn parse_field_value_nom<'a>(
                 }
             }
         }
-        5 => { // 32-bit
+        5 => {
+            // 32-bit
             match proto_type {
                 "float" => {
                     let (input, val) = le_f32(input)?;
-                    Ok((input, serde_json::Number::from_f64(val as f64).map(Value::Number).unwrap_or(Value::Null)))
-                },
-                _ => { // fixed32, sfixed32
+                    Ok((
+                        input,
+                        serde_json::Number::from_f64(val as f64)
+                            .map(Value::Number)
+                            .unwrap_or(Value::Null),
+                    ))
+                }
+                _ => {
+                    // fixed32, sfixed32
                     let (input, val) = le_u32(input)?;
                     Ok((input, Value::Number(val.into())))
                 }
@@ -303,14 +323,23 @@ fn parse_field_value_nom<'a>(
 /// Skip a field safely if we don't know the tag
 fn skip_field_value_nom(input: &[u8], wire_type: u8) -> IResult<&[u8], ()> {
     match wire_type {
-        0 => { let (i, _) = parse_varint(input)?; Ok((i, ())) },
-        1 => { let (i, _) = take(8usize)(input)?; Ok((i, ())) },
+        0 => {
+            let (i, _) = parse_varint(input)?;
+            Ok((i, ()))
+        }
+        1 => {
+            let (i, _) = take(8usize)(input)?;
+            Ok((i, ()))
+        }
         2 => {
             let (i, len) = parse_varint(input)?;
             let (i, _) = take(len as usize)(i)?;
             Ok((i, ()))
-        },
-        5 => { let (i, _) = take(4usize)(input)?; Ok((i, ())) },
+        }
+        5 => {
+            let (i, _) = take(4usize)(input)?;
+            Ok((i, ()))
+        }
         _ => Err(nom::Err::Error(NomError::new(input, ErrorKind::Tag))),
     }
 }
@@ -336,7 +365,10 @@ fn parse_varint(input: &[u8]) -> IResult<&[u8], u64> {
 //      Internal Logic: Encoder
 // ==========================================
 
-fn encode_message_to_wire(message_def: &ProtoMessage, obj: &serde_json::Map<String, Value>) -> Result<Vec<u8>, String> {
+fn encode_message_to_wire(
+    message_def: &ProtoMessage,
+    obj: &serde_json::Map<String, Value>,
+) -> Result<Vec<u8>, String> {
     let mut result = Vec::new();
 
     let field_map: HashMap<&str, &ProtoField> = message_def
@@ -352,7 +384,7 @@ fn encode_message_to_wire(message_def: &ProtoMessage, obj: &serde_json::Map<Stri
             if let Some(arr) = value.as_array() {
                 // Special case: Bytes might be a string in JSON, not an array
                 if field.proto_type == "bytes" && value.is_string() {
-                     encode_field(&mut result, field.field_number, &field.proto_type, value)?;
+                    encode_field(&mut result, field.field_number, &field.proto_type, value)?;
                 } else {
                     for item in arr {
                         encode_field(&mut result, field.field_number, &field.proto_type, item)?;
@@ -367,7 +399,12 @@ fn encode_message_to_wire(message_def: &ProtoMessage, obj: &serde_json::Map<Stri
     Ok(result)
 }
 
-fn encode_field(result: &mut Vec<u8>, field_number: u32, proto_type: &str, value: &Value) -> Result<(), String> {
+fn encode_field(
+    result: &mut Vec<u8>,
+    field_number: u32,
+    proto_type: &str,
+    value: &Value,
+) -> Result<(), String> {
     let wire_type = match proto_type {
         "int32" | "int64" | "uint32" | "uint64" | "sint32" | "sint64" | "bool" | "enum" => 0,
         "fixed64" | "sfixed64" | "double" => 1,
@@ -380,23 +417,40 @@ fn encode_field(result: &mut Vec<u8>, field_number: u32, proto_type: &str, value
     write_varint(result, tag as u64);
 
     match wire_type {
-        0 => { // Varint
+        0 => {
+            // Varint
             let val = match value {
-                Value::Bool(b) => if *b { 1 } else { 0 },
-                Value::Number(n) => n.as_u64().or_else(|| n.as_i64().map(|i| i as u64)).unwrap_or(0),
+                Value::Bool(b) => {
+                    if *b {
+                        1
+                    } else {
+                        0
+                    }
+                }
+                Value::Number(n) => n
+                    .as_u64()
+                    .or_else(|| n.as_i64().map(|i| i as u64))
+                    .unwrap_or(0),
                 Value::String(s) => s.parse::<u64>().unwrap_or(0), // Loose string-to-int parsing
                 _ => 0,
             };
 
             // ZigZag encoding for sint
             let final_val = match proto_type {
-                "sint32" => { let n = val as i32; ((n << 1) ^ (n >> 31)) as u32 as u64 },
-                "sint64" => { let n = val as i64; ((n << 1) ^ (n >> 63)) as u64 },
+                "sint32" => {
+                    let n = val as i32;
+                    ((n << 1) ^ (n >> 31)) as u32 as u64
+                }
+                "sint64" => {
+                    let n = val as i64;
+                    ((n << 1) ^ (n >> 63)) as u64
+                }
                 _ => val,
             };
             write_varint(result, final_val);
         }
-        1 => { // 64-bit
+        1 => {
+            // 64-bit
             if proto_type == "double" {
                 let v = value.as_f64().unwrap_or(0.0);
                 result.extend_from_slice(&v.to_le_bytes());
@@ -405,7 +459,8 @@ fn encode_field(result: &mut Vec<u8>, field_number: u32, proto_type: &str, value
                 result.extend_from_slice(&v.to_le_bytes());
             }
         }
-        2 => { // Length Delimited
+        2 => {
+            // Length Delimited
             if proto_type == "string" {
                 let s = value.as_str().unwrap_or("");
                 write_varint(result, s.len() as u64);
@@ -429,7 +484,8 @@ fn encode_field(result: &mut Vec<u8>, field_number: u32, proto_type: &str, value
                 }
             }
         }
-        5 => { // 32-bit
+        5 => {
+            // 32-bit
             if proto_type == "float" {
                 let v = value.as_f64().unwrap_or(0.0) as f32;
                 result.extend_from_slice(&v.to_le_bytes());
@@ -455,7 +511,10 @@ fn write_varint(result: &mut Vec<u8>, mut value: u64) {
 fn is_empty_json_value(value: &Value) -> bool {
     match value {
         Value::String(s) => s.is_empty(),
-        Value::Number(n) => n.as_u64().map(|v| v == 0).unwrap_or(false) && n.as_f64().map(|v| v == 0.0).unwrap_or(false),
+        Value::Number(n) => {
+            n.as_u64().map(|v| v == 0).unwrap_or(false)
+                && n.as_f64().map(|v| v == 0.0).unwrap_or(false)
+        }
         Value::Bool(b) => !*b,
         Value::Null => true,
         Value::Array(a) => a.is_empty(),

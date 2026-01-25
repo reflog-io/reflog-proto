@@ -32,13 +32,7 @@ pub const CUSTOM_PROTO_CONTENT: &str = include_str!("../proto/custom.proto");
 // Re-export commonly used types
 pub use proto_parser::{ProtoField, ProtoMessage};
 pub use schema::{
-    get_entity_types,
-    get_message_definition,
-    initialize_entity_registry,
-    initialize_entity_registry_from_content,
-    is_valid_entity_type,
-    json_to_payload,
-    payload_to_json,
-    payload_to_json_partial,
-    reload_entity_registry,
+    get_entity_types, get_message_definition, initialize_entity_registry,
+    initialize_entity_registry_from_content, is_valid_entity_type, json_to_payload,
+    payload_to_json, payload_to_json_partial, reload_entity_registry,
 };

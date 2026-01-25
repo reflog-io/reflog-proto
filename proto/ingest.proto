@@ -2,8 +2,6 @@ syntax = "proto3";
 
 package reflog.v1;
 
-import "options.proto";
-
 message IngestRecord {
   string entity_type = 1;
   string entity_id = 2;
