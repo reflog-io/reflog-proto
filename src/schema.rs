@@ -55,7 +55,7 @@ fn initialize_registry_from_messages(
 
     // Helper to register messages recursively (supporting nested definitions)
     fn register_recursive(msg: ProtoMessage, reg: &mut HashMap<String, ProtoMessage>) {
-        reg.insert(msg.name.to_lowercase(), msg.clone());
+        reg.insert(msg.name.clone(), msg.clone());
         for nested in msg.nested_messages {
             register_recursive(nested, reg);
         }
@@ -90,7 +90,7 @@ pub fn get_message_definition(entity_type: &str) -> Result<ProtoMessage, String>
     let reg = registry
         .read()
         .map_err(|_| "entity registry lock poisoned".to_string())?;
-    reg.get(&entity_type.to_lowercase())
+    reg.get(entity_type)
         .cloned()
         .ok_or_else(|| format!("unknown entity type: {entity_type}"))
 }
@@ -101,7 +101,7 @@ pub fn is_valid_entity_type(entity_type: &str) -> bool {
         .get()
         .and_then(|registry| {
             let reg = registry.read().ok()?;
-            reg.get(&entity_type.to_lowercase()).map(|_| ())
+            reg.get(entity_type).map(|_| ())
         })
         .is_some()
 }
