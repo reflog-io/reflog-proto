@@ -1,16 +1,10 @@
 //! Parser for .proto files to extract message and field definitions.
-//! Uses `nom` to handle grammar, nesting, and whitespace robustly.
+//! Uses protobuf descriptors for robust schema introspection.
 
-use nom::{
-    branch::alt,
-    bytes::complete::{is_not, tag, take_until},
-    character::complete::{alpha1, alphanumeric1, char, digit1, multispace1, none_of},
-    combinator::{map, opt, recognize, value},
-    multi::{many0, separated_list0},
-    sequence::{delimited, pair, preceded, tuple},
-    IResult,
-};
-use std::collections::HashMap;
+use prost_reflect::{DescriptorPool, FieldDescriptor, Kind, MessageDescriptor, Value};
+use protox::Compiler;
+use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone)]
 pub struct ProtoField {
@@ -33,21 +27,49 @@ pub fn parse_proto_file(
     proto_path: &std::path::Path,
 ) -> Result<Vec<ProtoMessage>, Box<dyn std::error::Error>> {
     let content = std::fs::read_to_string(proto_path)?;
-    // Timestamp fields (created_at_utc, updated_at_utc, deleted_at_utc) are now
-    // provided at the top level in IngestRecord, so we no longer add them to payload messages
-    parse_proto_content(&content)
+    let virtual_name = proto_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("schema.proto");
+    let include_dir = proto_path.parent().unwrap_or_else(|| Path::new("."));
+    parse_proto_content_internal(&content, virtual_name, Some(include_dir))
 }
 
 /// Parse proto content and extract entity message definitions.
 /// Note: Timestamp fields (created_at_utc, updated_at_utc, deleted_at_utc) are now
 /// provided at the top level in IngestRecord, so they are no longer added to payload messages.
 pub fn parse_proto_content(content: &str) -> Result<Vec<ProtoMessage>, Box<dyn std::error::Error>> {
-    // 1. Run the nom parser on the whole content
-    let (_, mut items) =
-        parse_proto_root(content).map_err(|e| format!("Failed to parse proto file: {}", e))?;
+    parse_proto_content_internal(content, "schema.proto", None)
+}
 
-    // 2. Filter out system messages
-    // (We do this post-parse to keep the grammar clean)
+pub(crate) fn descriptor_pool_from_file(
+    proto_path: &Path,
+) -> Result<DescriptorPool, Box<dyn std::error::Error>> {
+    let content = std::fs::read_to_string(proto_path)?;
+    let virtual_name = proto_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("schema.proto");
+    let include_dir = proto_path.parent().unwrap_or_else(|| Path::new("."));
+    build_descriptor_pool(&content, virtual_name, Some(include_dir))
+}
+
+pub(crate) fn descriptor_pool_from_content(
+    content: &str,
+) -> Result<DescriptorPool, Box<dyn std::error::Error>> {
+    build_descriptor_pool(content, "schema.proto", None)
+}
+
+fn parse_proto_content_internal(
+    content: &str,
+    virtual_file_name: &str,
+    include_dir: Option<&Path>,
+) -> Result<Vec<ProtoMessage>, Box<dyn std::error::Error>> {
+    let pool = build_descriptor_pool(content, virtual_file_name, include_dir)?;
+    let root_file = pool
+        .get_file_by_name(virtual_file_name)
+        .ok_or_else(|| format!("compiled descriptor missing file {virtual_file_name}"))?;
+
     let excluded_messages = [
         "IngestRecord",
         "IngestResponse",
@@ -58,233 +80,121 @@ pub fn parse_proto_content(content: &str) -> Result<Vec<ProtoMessage>, Box<dyn s
         "GetProtosResponse",
     ];
 
-    items.retain(|msg| !excluded_messages.contains(&msg.name.as_str()));
+    let mut result = Vec::new();
+    for message in root_file.messages() {
+        if excluded_messages.contains(&message.name()) {
+            continue;
+        }
+        if message.is_map_entry() {
+            continue;
+        }
+        result.push(convert_message(message));
+    }
 
-    // Timestamp fields are now provided at the top level in IngestRecord,
-    // so we no longer add them to payload messages here.
-
-    Ok(items)
+    Ok(result)
 }
 
-// ==========================================
-//           Nom Parser Logic
-// ==========================================
+fn build_descriptor_pool(
+    content: &str,
+    virtual_file_name: &str,
+    include_dir: Option<&Path>,
+) -> Result<DescriptorPool, Box<dyn std::error::Error>> {
+    let unique = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let temp_dir = std::env::temp_dir().join(format!("reflog_proto_{unique}"));
+    std::fs::create_dir_all(&temp_dir)?;
 
-/// Parses whitespace and comments (// ... or /* ... */)
-fn ws(input: &str) -> IResult<&str, &str> {
-    recognize(many0(alt((
-        multispace1,
-        preceded(tag("//"), take_until("\n")),
-        recognize(delimited(tag("/*"), take_until("*/"), tag("*/"))),
-    ))))(input)
+    let file_path = temp_dir.join(virtual_file_name);
+    if let Some(parent) = file_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&file_path, content)?;
+
+    // Provide built-in custom options for standalone content parsing.
+    // This makes `parse_proto_content` work when the schema imports `options.proto`.
+    if virtual_file_name != "options.proto" {
+        std::fs::write(temp_dir.join("options.proto"), include_str!("../proto/options.proto"))?;
+    }
+
+    let mut include_paths = vec![temp_dir.as_path()];
+    if let Some(include) = include_dir {
+        include_paths.push(include);
+    }
+
+    let mut compiler = Compiler::new(include_paths)?;
+    compiler
+        .include_imports(true)
+        .include_source_info(true)
+        .open_files([virtual_file_name])?;
+    let encoded = compiler.encode_file_descriptor_set();
+    let pool = DescriptorPool::decode(encoded.as_slice())?;
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    Ok(pool)
 }
 
-/// Helper to wrap a parser with whitespace handling
-fn ws_delimited<'a, O, F>(inner: F) -> impl FnMut(&'a str) -> IResult<&'a str, O>
-where
-    F: FnMut(&'a str) -> IResult<&'a str, O>,
-{
-    delimited(ws, inner, ws)
+fn convert_message(message: MessageDescriptor) -> ProtoMessage {
+    let fields = message.fields().map(convert_field).collect();
+    let nested_messages = message
+        .child_messages()
+        .filter(|child| !child.is_map_entry())
+        .map(convert_message)
+        .collect();
+
+    ProtoMessage {
+        name: message.name().to_string(),
+        fields,
+        nested_messages,
+    }
 }
 
-/// Identifiers (e.g., MessageName, field_name, package.name)
-fn identifier(input: &str) -> IResult<&str, &str> {
-    recognize(pair(
-        alt((alpha1, tag("_"))),
-        many0(alt((alphanumeric1, tag("_"), tag(".")))),
-    ))(input)
-}
-
-/// Parse a quoted string literal: "value"
-fn string_literal(input: &str) -> IResult<&str, String> {
-    delimited(
-        char('"'),
-        map(many0(none_of("\"")), |chars: Vec<char>| {
-            chars.into_iter().collect()
-        }),
-        char('"'),
-    )(input)
-}
-
-/// Parse field options: [(reflog.v1.foreign_key) = "Val", (other) = "x"]
-/// Supports multi-line options with proper whitespace handling
-fn parse_field_options(input: &str) -> IResult<&str, HashMap<String, String>> {
-    let option_pair = map(
-        tuple((
-            opt(char('(')),
-            identifier,
-            opt(char(')')),
-            ws_delimited(char('=')),
-            string_literal,
-        )),
-        |(_, key, _, _, val)| (key.to_string(), val),
-    );
-
-    // Handle whitespace/newlines inside brackets by using ws_delimited for the delimited parser
-    let options_list = delimited(
-        ws_delimited(char('[')),
-        separated_list0(ws_delimited(char(',')), option_pair),
-        ws_delimited(char(']')),
-    );
-
-    map(options_list, |opts| opts.into_iter().collect())(input)
-}
-
-/// Parse a single field definition
-/// matches: `optional string name = 1 [(options)];`
-fn parse_proto_field(input: &str) -> IResult<&str, ProtoField> {
-    let (input, _) = opt(ws_delimited(alt((
-        tag("repeated"),
-        tag("optional"),
-        tag("required"),
-    ))))(input)?;
-
-    // Parse Type (handles map<string, int> and standard types)
-    let (input, proto_type) = ws_delimited(recognize(pair(
-        identifier,
-        opt(delimited(char('<'), is_not(">"), char('>'))),
-    )))(input)?;
-
-    let (input, name) = ws_delimited(identifier)(input)?;
-    let (input, _) = ws_delimited(char('='))(input)?;
-    let (input, field_number) = ws_delimited(digit1)(input)?;
-
-    // Parse Options (optional)
-    let (input, options) = opt(ws_delimited(parse_field_options))(input)?;
-    let (input, _) = ws_delimited(char(';'))(input)?;
-
-    // Extract special keys
+fn convert_field(field: FieldDescriptor) -> ProtoField {
     let mut foreign_key = None;
     let mut relationship_type = None;
 
-    if let Some(opts) = options {
-        // We look for keys ending in foreign_key or relationship_type
-        // to handle fully qualified keys like `reflog.v1.foreign_key`
-        for (k, v) in opts {
-            if k.contains("foreign_key") {
-                foreign_key = Some(v);
-            } else if k.contains("relationship_type") {
-                relationship_type = Some(v);
-            }
+    let options = field.options();
+    for (extension, value) in options.extensions() {
+        let short_name = extension.name();
+        let full_name = extension.full_name();
+        if short_name == "foreign_key" || full_name.ends_with(".foreign_key") {
+            foreign_key = dynamic_value_as_string(value);
+        } else if short_name == "relationship_type" || full_name.ends_with(".relationship_type") {
+            relationship_type = dynamic_value_as_string(value);
         }
     }
-
-    Ok((
-        input,
-        ProtoField {
-            name: name.to_string(),
-            proto_type: proto_type.to_string(),
-            field_number: field_number.parse().unwrap_or(0),
-            foreign_key,
-            relationship_type,
-        },
-    ))
+    ProtoField {
+        name: field.name().to_string(),
+        proto_type: kind_to_proto_type(field.kind()),
+        field_number: field.number(),
+        foreign_key,
+        relationship_type,
+    }
 }
 
-/// Parse a Message block (recursive)
-fn parse_message(input: &str) -> IResult<&str, ProtoMessage> {
-    let (input, _) = ws_delimited(tag("message"))(input)?;
-    let (input, name) = ws_delimited(identifier)(input)?;
-    let (input, _) = ws_delimited(char('{'))(input)?;
-
-    // Inner loop to handle contents of message
-    // We only care about Fields and Nested Messages, but we must parse (and ignore)
-    // things like `option`, `reserved`, etc., so the parser doesn't get stuck.
-    #[derive(Clone)]
-    enum Item {
-        Field(ProtoField),
-        Nested(ProtoMessage),
-        Ignored,
+fn kind_to_proto_type(kind: Kind) -> String {
+    match kind {
+        Kind::Double => "double".to_string(),
+        Kind::Float => "float".to_string(),
+        Kind::Int32 => "int32".to_string(),
+        Kind::Int64 => "int64".to_string(),
+        Kind::Uint32 => "uint32".to_string(),
+        Kind::Uint64 => "uint64".to_string(),
+        Kind::Sint32 => "sint32".to_string(),
+        Kind::Sint64 => "sint64".to_string(),
+        Kind::Fixed32 => "fixed32".to_string(),
+        Kind::Fixed64 => "fixed64".to_string(),
+        Kind::Sfixed32 => "sfixed32".to_string(),
+        Kind::Sfixed64 => "sfixed64".to_string(),
+        Kind::Bool => "bool".to_string(),
+        Kind::String => "string".to_string(),
+        Kind::Bytes => "bytes".to_string(),
+        Kind::Message(msg) => msg.name().to_string(),
+        Kind::Enum(enum_desc) => enum_desc.name().to_string(),
     }
-
-    let (input, items) = many0(alt((
-        map(parse_message, Item::Nested),
-        map(parse_proto_field, Item::Field),
-        // Ignorables:
-        // 1. Reserved statements: reserved 1, 2;
-        value(
-            Item::Ignored,
-            tuple((ws_delimited(tag("reserved")), take_until(";"), char(';'))),
-        ),
-        // 2. Option statements: option (x) = y;
-        value(
-            Item::Ignored,
-            tuple((ws_delimited(tag("option")), take_until(";"), char(';'))),
-        ),
-        // 3. Map fields (if using `map` keyword specifically, though `parse_proto_field` handles map types)
-        // 4. OneOfs (simple skip for now, can be expanded)
-        value(
-            Item::Ignored,
-            tuple((
-                ws_delimited(tag("oneof")),
-                identifier,
-                ws_delimited(char('{')),
-                take_until("}"),
-            )),
-        ),
-    )))(input)?;
-
-    let (input, _) = ws_delimited(char('}'))(input)?;
-
-    let mut fields = Vec::new();
-    let mut nested_messages = Vec::new();
-
-    for item in items {
-        match item {
-            Item::Field(f) => fields.push(f),
-            Item::Nested(m) => nested_messages.push(m),
-            Item::Ignored => {}
-        }
-    }
-
-    Ok((
-        input,
-        ProtoMessage {
-            name: name.to_string(),
-            fields,
-            nested_messages,
-        },
-    ))
 }
 
-/// Top level parser: handles syntax decl, package, imports, service, and messages
-fn parse_proto_root(input: &str) -> IResult<&str, Vec<ProtoMessage>> {
-    let (input, _) = ws(input)?; // Consume leading whitespace
-
-    let (input, found_items) = many0(alt((
-        map(parse_message, Some),
-        // Skip Syntax
-        value(
-            None,
-            tuple((ws_delimited(tag("syntax")), take_until(";"), char(';'))),
-        ),
-        // Skip Package
-        value(
-            None,
-            tuple((ws_delimited(tag("package")), take_until(";"), char(';'))),
-        ),
-        // Skip Imports
-        value(
-            None,
-            tuple((ws_delimited(tag("import")), take_until(";"), char(';'))),
-        ),
-        // Skip Options
-        value(
-            None,
-            tuple((ws_delimited(tag("option")), take_until(";"), char(';'))),
-        ),
-        // Skip Service (and its body)
-        value(
-            None,
-            tuple((
-                ws_delimited(tag("service")),
-                identifier,
-                ws_delimited(char('{')),
-                take_until("}"), // Lazy skip of service body
-                char('}'),
-            )),
-        ),
-    )))(input)?;
-
-    Ok((input, found_items.into_iter().flatten().collect()))
+fn dynamic_value_as_string(value: &Value) -> Option<String> {
+    match value {
+        Value::String(s) => Some(s.clone()),
+        _ => None,
+    }
 }
